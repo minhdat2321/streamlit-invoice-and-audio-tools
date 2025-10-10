@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Local data
+sample_data/audio/*
+sample_data/invoices/*
+!sample_data/invoices/README.md
+
+# Credentials
+.env
+.streamlit/secrets.toml

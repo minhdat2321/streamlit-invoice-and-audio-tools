@@ -1,0 +1,1 @@
+Place a few invoice images here for local testing. This folder is git-ignored by default.

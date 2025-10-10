@@ -1,0 +1,8 @@
+streamlit>=1.37
+openai>=1.43
+pydantic>=2.7
+python-dateutil>=2.9
+pillow>=10.3
+pandas>=2.2
+xlsxwriter>=3.2
+python-dotenv>=1.0
