@@ -2,6 +2,7 @@ import io
 import os
 from pathlib import Path
 from datetime import datetime
+from tempfile import NamedTemporaryFile
 
 import streamlit as st
 import pandas as pd
@@ -10,11 +11,14 @@ from utils.openai_client import get_openai_client
 from tools.recording_text_extract import transcribe_file_like
 from tools.invoices_extract import extract_records_from_images
 
-APP_TITLE = "AI Tools: Transcribe & Invoice Extract"
+# NEW: bilingual module
+from tools.bilingual_fill import process_docx as process_bilingual
+
+APP_TITLE = "AI Tools: Transcribe • Invoice Extract • Bilingual DOCX"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎛️", layout="wide")
 st.title(APP_TITLE)
-st.caption("Built with Streamlit • OpenAI API • Pydantic • Pandas")
+st.caption("Built with Streamlit • OpenAI API • Pydantic • Pandas • python-docx")
 
 # --- API Key handling ---
 def resolve_api_key():
@@ -50,23 +54,33 @@ with st.sidebar:
     st.session_state.setdefault("invoice_model", "gpt-4o")
     invoice_model = st.text_input("Vision model", value=st.session_state["invoice_model"], help="e.g., gpt-4o")
 
+    st.write("**Bilingual DOCX**")
+    st.session_state.setdefault("bilingual_model", "gpt-4o-mini")
+    bilingual_model = st.text_input("Translation model", value=st.session_state["bilingual_model"], help="e.g., gpt-4o-mini")
+    bilingual_labels = st.checkbox("Show [VI]/[EN] labels", value=True)
+    table_mode = st.radio("Table mode", ["stack", "inline"], index=0, help="How to place EN in table cells")
+
 client = get_openai_client(openai_key, org=st.session_state.get("org")) if openai_key else None
 
 st.divider()
 
 # ==================================
-# Tab 1 — Audio → Text transcription
+# Tabs
 # ==================================
 
-t1, t2 = st.tabs(["🔊 Transcribe Audio", "🧾 Extract Invoices"])
+t1, t2, t3 = st.tabs(["🔊 Transcribe Audio", "🧾 Extract Invoices", "📝 Bilingual DOCX (VI → EN)"])
 
+# ==================================
+# Tab 1 — Audio → Text transcription
+# ==================================
 with t1:
     st.subheader("Upload audio to transcribe")
-    audio = st.file_uploader("Select an audio file (mp3, m4a, wav)", type=["mp3", "m4a", "wav", "aac", "flac", "ogg"])
+    audio = st.file_uploader("Select an audio file (mp3, m4a, wav, aac, flac, ogg)", type=["mp3", "m4a", "wav", "aac", "flac", "ogg"])
     colA, colB = st.columns([1,1])
 
     with colA:
-        st.audio(audio) if audio else None
+        if audio:
+            st.audio(audio)
     with colB:
         st.write("\n")
         st.caption("Choose format (TXT by default; SRT/VTT include timestamps)")
@@ -74,7 +88,6 @@ with t1:
 
     if run_asr and client and audio:
         with st.spinner("Transcribing…"):
-            # Use file-like interface and chosen options
             text = transcribe_file_like(
                 client=client,
                 file_like=io.BytesIO(audio.getvalue()),
@@ -102,7 +115,6 @@ with t2:
 
     if run_ie and client and imgs:
         with st.spinner("Extracting… this may take a moment for multiple files"):
-            # Convert uploaded images into in-memory bytes list with names
             files = [(img.name, img.getvalue()) for img in imgs]
             df, notes = extract_records_from_images(client=client, files=files, model=invoice_model)
 
@@ -121,3 +133,68 @@ with t2:
             with st.expander("Confidence notes / warnings"):
                 for n in notes:
                     st.markdown(f"- {n}")
+
+# ==================================
+# Tab 3 — Bilingual DOCX
+# ==================================
+with t3:
+    st.subheader("Upload a Word document (.docx) to make it bilingual")
+    st.caption("Vietnamese will be kept first; English will be appended and styled as *italic* + Accent 1 (blue). Bold/italic spans are preserved exactly.")
+
+    docx_file = st.file_uploader("Select a .docx file", type=["docx"], key="docx_upload")
+    run_bi = st.button("Convert to Bilingual DOCX", use_container_width=True, disabled=not (client and docx_file))
+
+    # Translator wrapper that matches the tags contract in tools/bilingual_fill.py
+    def make_openai_translator(_client, _model: str):
+        # Expecting tools.bilingual_fill to call translate_fn(tagged_text, src_lang)
+        def translate_fn(text_with_tags: str, src_lang: str) -> str:
+            target = "English" if src_lang == "vi" else "Vietnamese"
+            sys = (
+                "You are a professional translator. Translate the content while "
+                "STRICTLY preserving these inline tags: <b>, </b>, <i>, </i>, <bi>, </bi>. "
+                "Do not remove, add, or reorder tags; keep them around the same phrases they wrap. "
+                "Preserve numbers, units, and proper nouns."
+            )
+            resp = _client.responses.create(
+                model=_model,
+                input=[
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": f"Translate to {target}:\n\n{text_with_tags}"}
+                ]
+            )
+            return resp.output_text or ""
+        return translate_fn
+
+    if run_bi and client and docx_file:
+        translate_fn = make_openai_translator(client, bilingual_model)
+
+        # Write input to a temp file, process, and serve
+        with NamedTemporaryFile(delete=False, suffix=".docx") as in_tmp:
+            in_tmp.write(docx_file.getvalue())
+            in_tmp.flush()
+            in_path = in_tmp.name
+
+        out_tmp = NamedTemporaryFile(delete=False, suffix=".docx")
+        out_tmp.close()
+
+        with st.spinner("Translating and formatting…"):
+            # The bilingual module already enforces:
+            # - VI first, EN second
+            # - EN italic + Accent1 blue
+            # - Preserve bold/italic spans
+            process_bilingual(
+                in_path=in_path,
+                out_path=out_tmp.name,
+                translate_fn=translate_fn,
+                add_labels=bilingual_labels,
+                table_mode=table_mode,
+            )
+
+        with open(out_tmp.name, "rb") as f:
+            st.download_button(
+                label="Download bilingual .docx",
+                data=f.read(),
+                file_name=Path(docx_file.name).with_suffix(".bilingual.docx").name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        st.success("Done! Vietnamese first, English italic + Accent 1.")
