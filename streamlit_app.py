@@ -2,7 +2,6 @@ import io
 import os
 from pathlib import Path
 from datetime import datetime
-from tempfile import NamedTemporaryFile
 
 import streamlit as st
 import pandas as pd
@@ -10,9 +9,7 @@ import pandas as pd
 from utils.openai_client import get_openai_client
 from tools.audio_to_conversation import transcribe_meeting
 from tools.invoices_extract import extract_records_from_images
-
-# NEW: bilingual module
-from tools.bilingual_fill import process_docx as process_bilingual
+from tools.bilingual_fill import process_docx_bytes
 
 APP_TITLE = "AI Tools: Transcribe • Invoice Extract • Bilingual DOCX"
 
@@ -55,10 +52,13 @@ with st.sidebar:
     invoice_model = st.text_input("Vision model", value=st.session_state["invoice_model"], help="e.g., gpt-4o")
 
     st.write("**Bilingual DOCX**")
-    st.session_state.setdefault("bilingual_model", "gpt-4o-mini")
-    bilingual_model = st.text_input("Translation model", value=st.session_state["bilingual_model"], help="e.g., gpt-4o-mini")
-    bilingual_labels = st.checkbox("Show [VI]/[EN] labels", value=True)
-    table_mode = st.radio("Table mode", ["stack", "inline"], index=0, help="How to place EN in table cells")
+    sidebar_default_model = st.session_state.get("sidebar_bilingual_model", "gpt-4o-mini")
+    st.text_input(
+        "Default translation model",
+        key="sidebar_bilingual_model",
+        value=sidebar_default_model,
+        help="e.g., gpt-4o-mini",
+    )
 
 client = get_openai_client(openai_key, org=st.session_state.get("org")) if openai_key else None
 
@@ -137,106 +137,106 @@ with t2:
 # Tab 3 — Bilingual DOCX
 # ==============================
 with t3:
-    st.subheader("Upload a Word document (.docx) to make it bilingual (FAST mode)")
-    st.caption("Vietnamese stays first; English is appended and styled as *italic* + Accent 1 (blue). Bold/italic spans are preserved exactly. Nested tables supported.")
+    st.subheader("Upload a Word document (.docx) to make it bilingual")
+    st.caption(
+        "Vietnamese stays first; English is appended and styled as *italic* + Accent 1 (blue)."
+        " Paragraph heuristics are shared with the bilingual_fill.py CLI."
+    )
 
     docx_file = st.file_uploader("Select a .docx file", type=["docx"], key="docx_upload")
 
-    # Custom system prompt (default provided)
-    st.markdown("**Translator prompt (system)**")
-    default_sys_prompt = (
-        "You are a professional translator. Translate the content while "
-        "STRICTLY preserving these inline tags: <b>, </b>, <i>, </i>, <bi>, </bi>. "
-        "Do not remove, add, or reorder tags; keep them around the same phrases they wrap. "
-        "Preserve numbers, units, and proper nouns. Use clear, concise business style."
-    )
-    sys_prompt_input = st.text_area(
-        "Customize (optional)",
-        value=default_sys_prompt,
-        height=140,
-        help="This is the system prompt sent to the model. Keep the tag rules."
-    )
+    col_left, col_right = st.columns(2)
+    with col_left:
+        process_headers = st.checkbox("Process headers", value=False)
+        process_footers = st.checkbox("Process footers", value=False)
+        min_len = st.number_input(
+            "Minimum paragraph length",
+            min_value=0,
+            max_value=200,
+            value=3,
+            step=1,
+            help="Paragraphs shorter than this are skipped.",
+        )
+        window = st.slider(
+            "Neighbor window for pairing/dedup",
+            min_value=1,
+            max_value=20,
+            value=5,
+            help="How many nearby paragraphs to inspect when pairing and avoiding duplicates.",
+        )
 
-    skip_bilingual = st.checkbox(
-        "Skip paragraphs/cells that already look bilingual",
-        value=True,
-        help="If a block already contains both Vietnamese and English (e.g., 'VI … / EN …' or '[VI]… [EN]…'), it will be left untouched."
-    )
-
-    batch_size = st.slider("Batch size per API call", min_value=20, max_value=200, value=100, step=20,
-                           help="Larger batches reduce overhead but may hit token limits on very big docs.")
-
-    run_bi = st.button("Convert to Bilingual DOCX (Batched)", use_container_width=True, disabled=not (client and docx_file))
-
-    # Batched translate callable:
-    #  input:  [{"id": "...", "text": "<bi>...</bi>", "src_lang": "vi|en"}, ...]
-    #  output: {id: "translated_tagged_text", ...}
-    def make_batched_translator(_client, _model: str, _system_prompt: str):
-        def translate_batch_callable(items):
-            # Build a single request with numbered items to reduce overhead.
-            # We ask the model to answer as JSON lines: id|||translated_text
-            user_lines = []
-            for it in items:
-                user_lines.append(f"{it['id']}|||{it['src_lang']}|||{it['text']}")
-            joined = "\n".join(user_lines)
-
-            # Instruct the model to return exactly one line per input, preserving tags.
-            sys = _system_prompt + "\n" + (
-                "Return one line per input in the form:\n"
-                "<id>|||<translated text with the SAME <b>,</b>,<i>,</i>,<bi>,</bi> tags preserved>\n"
-                "Do not add extra lines or explanations."
+    with col_right:
+        sidebar_model = st.session_state.get("sidebar_bilingual_model", "gpt-4o-mini")
+        chat_model = st.text_input(
+            "Chat translation model",
+            value=sidebar_model,
+            key="bilingual_chat_model",
+            help="Leave blank to skip OpenAI translation (styles only).",
+        )
+        temp = st.slider(
+            "Translation temperature",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.2,
+            step=0.05,
+        )
+        use_embeddings = st.checkbox(
+            "Use embeddings for VN–EN pairing",
+            value=False,
+            help="Requires an embeddings model and OpenAI key.",
+        )
+        if use_embeddings:
+            embed_model = st.text_input(
+                "Embedding model",
+                value=st.session_state.get("bilingual_embed_model", ""),
+                key="bilingual_embed_model",
+                help="e.g., text-embedding-3-large",
             )
-
-            resp = _client.responses.create(
-                model=_model,
-                input=[
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": "Translate each line below. Each line is: id|||src_lang|||tagged_text\n\n" + joined}
-                ]
+            embed_thresh = st.slider(
+                "Embedding cosine threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.80,
+                step=0.01,
+                help="Higher = stricter pairing when embeddings are enabled.",
             )
-            out = resp.output_text or ""
-            mapping = {}
-            for line in out.splitlines():
-                if "|||" not in line:
-                    continue
-                # split only on first 1 occurrence (id and the rest)
-                parts = line.split("|||", 1)
-                if len(parts) == 2:
-                    _id, trans = parts[0].strip(), parts[1]
-                    mapping[_id] = trans
-            return mapping
-        return translate_batch_callable
+        else:
+            embed_model = ""
+            embed_thresh = 0.80
+            st.caption("Embeddings disabled → using heuristic length/punctuation pairing only.")
 
-    if run_bi and client and docx_file:
-        from tools.bilingual_fill import process_docx_batched
+    run_bi = st.button(
+        "Convert to bilingual DOCX",
+        use_container_width=True,
+        disabled=docx_file is None,
+    )
 
-        # Save upload to temp
-        with NamedTemporaryFile(delete=False, suffix=".docx") as in_tmp:
-            in_tmp.write(docx_file.getvalue())
-            in_tmp.flush()
-            in_path = in_tmp.name
+    if run_bi and docx_file:
+        if use_embeddings and not embed_model.strip():
+            st.error("Please provide an embeddings model or disable embeddings.")
+        else:
+            chat_model_opt = chat_model.strip() or None
+            embed_model_opt = embed_model.strip() or None
 
-        out_tmp = NamedTemporaryFile(delete=False, suffix=".docx")
-        out_tmp.close()
+            with st.spinner("Processing document with bilingual_fill.py…"):
+                result_bytes = process_docx_bytes(
+                    docx_file.getvalue(),
+                    headers=process_headers,
+                    footers=process_footers,
+                    min_len=int(min_len),
+                    chat_model=chat_model_opt,
+                    embed_model=embed_model_opt,
+                    use_embeddings=use_embeddings,
+                    embed_thresh=float(embed_thresh),
+                    window=int(window),
+                    temp=float(temp),
+                    api_key=openai_key,
+                )
 
-        translate_batch_callable = make_batched_translator(client, bilingual_model, sys_prompt_input)
-
-        with st.spinner("Collecting items and translating in batches…"):
-            process_docx_batched(
-                in_path=in_path,
-                out_path=out_tmp.name,
-                translate_batch_callable=translate_batch_callable,
-                add_labels=bilingual_labels,
-                table_mode=table_mode,
-                skip_if_bilingual=skip_bilingual,
-                batch_size=batch_size
-            )
-
-        with open(out_tmp.name, "rb") as f:
             st.download_button(
                 label="Download bilingual .docx",
-                data=f.read(),
+                data=result_bytes,
                 file_name=Path(docx_file.name).with_suffix(".bilingual.docx").name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
-        st.success("Done! (Batched)")
+            st.success("Done!")

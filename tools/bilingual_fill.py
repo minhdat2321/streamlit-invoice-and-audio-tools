@@ -11,6 +11,7 @@ Bilingual document styling:
 - FIXED: Improved translation coverage for English to Vietnamese
 """
 
+import io
 import os, re, math, time, copy, argparse
 from typing import Optional, Dict, List, Tuple, Set
 from zipfile import ZipFile
@@ -249,10 +250,11 @@ def build_paragraph_from_source(src_p, text, is_english: bool, match_size=True):
 
 # -------- OpenAI helpers --------
 class OpenAIHelper:
-    def __init__(self, chat_model: str, embed_model: Optional[str], temp: float):
+    def __init__(self, chat_model: str, embed_model: Optional[str], temp: float, api_key: Optional[str] = None):
         if not _OPENAI_AVAILABLE:
             raise RuntimeError("openai==1.x not installed. pip install openai")
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        key = api_key or os.getenv("OPENAI_API_KEY")
+        self.client = OpenAI(api_key=key)
         self.chat_model = chat_model
         self.embed_model = embed_model
         self.temp = temp
@@ -500,6 +502,72 @@ def process_xml_part(xml_bytes: bytes, min_len: int, helper: Optional[OpenAIHelp
     print(f"Processed {processed_count} paragraphs in this part")
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
 
+# -------- High-level helpers --------
+def process_docx_bytes(
+    docx_bytes: bytes,
+    *,
+    headers: bool = False,
+    footers: bool = False,
+    min_len: int = 3,
+    chat_model: Optional[str] = "gpt-4o-mini",
+    embed_model: Optional[str] = None,
+    use_embeddings: bool = False,
+    embed_thresh: float = 0.80,
+    window: int = 5,
+    temp: float = 0.2,
+    api_key: Optional[str] = None,
+) -> bytes:
+    """Process a DOCX payload and return updated bytes."""
+
+    helper = None
+    key = api_key or os.getenv("OPENAI_API_KEY")
+    if _OPENAI_AVAILABLE and chat_model and key:
+        helper = OpenAIHelper(
+            chat_model=chat_model,
+            embed_model=embed_model,
+            temp=temp,
+            api_key=key,
+        )
+
+    with ZipFile(io.BytesIO(docx_bytes)) as zin:
+        parts = {zi.filename: zin.read(zi.filename) for zi in zin.infolist()}
+
+    to_process = ["word/document.xml"]
+    if headers:
+        to_process += [name for name in parts if name.startswith("word/header") and name.endswith(".xml")]
+    if footers:
+        to_process += [name for name in parts if name.startswith("word/footer") and name.endswith(".xml")]
+
+    for part in to_process:
+        if part in parts:
+            parts[part] = process_xml_part(
+                parts[part],
+                min_len=min_len,
+                helper=helper,
+                use_embeddings=use_embeddings,
+                embed_thresh=embed_thresh,
+                window=window,
+            )
+
+    out_buf = io.BytesIO()
+    with ZipFile(out_buf, "w") as zout:
+        for name, data in parts.items():
+            zout.writestr(name, data)
+
+    return out_buf.getvalue()
+
+
+def process_docx(
+    input_path: str,
+    output_path: str,
+    **kwargs,
+):
+    with open(input_path, "rb") as fin:
+        result = process_docx_bytes(fin.read(), **kwargs)
+    with open(output_path, "wb") as fout:
+        fout.write(result)
+
+
 # -------- CLI --------
 def main():
     ap = argparse.ArgumentParser(description="Create bilingual document with Vietnamese first, English second.")
@@ -516,35 +584,22 @@ def main():
     ap.add_argument("--temp", type=float, default=0.2, help="Chat translation temperature.")
     args = ap.parse_args()
 
-    helper = None
-    if _OPENAI_AVAILABLE and args.chat_model:
-        helper = OpenAIHelper(chat_model=args.chat_model, embed_model=args.embed_model, temp=args.temp)
-
-    with ZipFile(args.input_docx) as zin:
-        parts = {zi.filename: zin.read(zi.filename) for zi in zin.infolist()}
-
-    to_process = ["word/document.xml"]
-    if args.headers:
-        to_process += [name for name in parts if name.startswith("word/header") and name.endswith(".xml")]
-    if args.footers:
-        to_process += [name for name in parts if name.startswith("word/footer") and name.endswith(".xml")]
-
-    for part in to_process:
-        if part in parts:
-            parts[part] = process_xml_part(
-                parts[part],
-                min_len=args.min_len,
-                helper=helper,
-                use_embeddings=args.use_embeddings,
-                embed_thresh=args.embed_thresh,
-                window=args.window,
-            )
-
-    with ZipFile(args.output_docx, "w") as zout:
-        for name, data in parts.items():
-            zout.writestr(name, data)
+    process_docx(
+        args.input_docx,
+        args.output_docx,
+        headers=args.headers,
+        footers=args.footers,
+        min_len=args.min_len,
+        chat_model=args.chat_model,
+        embed_model=args.embed_model,
+        use_embeddings=args.use_embeddings,
+        embed_thresh=args.embed_thresh,
+        window=args.window,
+        temp=args.temp,
+    )
 
     print(f"Done. Wrote: {args.output_docx}")
+
 
 if __name__ == "__main__":
     main()
