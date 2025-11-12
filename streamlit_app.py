@@ -8,7 +8,7 @@ import streamlit as st
 import pandas as pd
 
 from utils.openai_client import get_openai_client
-from tools.recording_text_extract import transcribe_file_like
+from tools.audio_to_conversation import transcribe_meeting
 from tools.invoices_extract import extract_records_from_images
 
 # NEW: bilingual module
@@ -38,7 +38,7 @@ openai_key = openai_key or manual_key
 if not openai_key:
     st.warning("Please set OPENAI_API_KEY in .streamlit/secrets.toml, environment, or enter it in the sidebar.")
 
-# Model pickers (keep conservative defaults)
+# Sidebar settings
 with st.sidebar:
     st.header("Settings")
     st.write("**General**")
@@ -64,15 +64,14 @@ client = get_openai_client(openai_key, org=st.session_state.get("org")) if opena
 
 st.divider()
 
-# ==================================
+# ==============================
 # Tabs
-# ==================================
-
+# ==============================
 t1, t2, t3 = st.tabs(["🔊 Transcribe Audio", "🧾 Extract Invoices", "📝 Bilingual DOCX (VI → EN)"])
 
-# ==================================
-# Tab 1 — Audio → Text transcription
-# ==================================
+# ==============================
+# Tab 1 — Audio → Text
+# ==============================
 with t1:
     st.subheader("Upload audio to transcribe")
     audio = st.file_uploader("Select an audio file (mp3, m4a, wav, aac, flac, ogg)", type=["mp3", "m4a", "wav", "aac", "flac", "ogg"])
@@ -88,11 +87,11 @@ with t1:
 
     if run_asr and client and audio:
         with st.spinner("Transcribing…"):
-            text = transcribe_file_like(
+            text = transcribe_meeting(
                 client=client,
                 file_like=io.BytesIO(audio.getvalue()),
                 filename=audio.name,
-                model=asr_model,
+                model_asr=asr_model,
                 language=asr_lang,
                 response_format=None if asr_fmt == "txt" else asr_fmt,
             )
@@ -105,9 +104,9 @@ with t1:
         else:
             st.error("No text produced.")
 
-# ==================================
+# ==============================
 # Tab 2 — Invoice images → table
-# ==================================
+# ==============================
 with t2:
     st.subheader("Upload invoice images (PNG/JPG/WebP/BMP/TIFF)")
     imgs = st.file_uploader("Select one or multiple images", type=["png","jpg","jpeg","webp","bmp","tiff"], accept_multiple_files=True)
@@ -134,41 +133,84 @@ with t2:
                 for n in notes:
                     st.markdown(f"- {n}")
 
-# ==================================
+# ==============================
 # Tab 3 — Bilingual DOCX
-# ==================================
+# ==============================
 with t3:
-    st.subheader("Upload a Word document (.docx) to make it bilingual")
-    st.caption("Vietnamese will be kept first; English will be appended and styled as *italic* + Accent 1 (blue). Bold/italic spans are preserved exactly.")
+    st.subheader("Upload a Word document (.docx) to make it bilingual (FAST mode)")
+    st.caption("Vietnamese stays first; English is appended and styled as *italic* + Accent 1 (blue). Bold/italic spans are preserved exactly. Nested tables supported.")
 
     docx_file = st.file_uploader("Select a .docx file", type=["docx"], key="docx_upload")
-    run_bi = st.button("Convert to Bilingual DOCX", use_container_width=True, disabled=not (client and docx_file))
 
-    # Translator wrapper that matches the tags contract in tools/bilingual_fill.py
-    def make_openai_translator(_client, _model: str):
-        # Expecting tools.bilingual_fill to call translate_fn(tagged_text, src_lang)
-        def translate_fn(text_with_tags: str, src_lang: str) -> str:
-            target = "English" if src_lang == "vi" else "Vietnamese"
-            sys = (
-                "You are a professional translator. Translate the content while "
-                "STRICTLY preserving these inline tags: <b>, </b>, <i>, </i>, <bi>, </bi>. "
-                "Do not remove, add, or reorder tags; keep them around the same phrases they wrap. "
-                "Preserve numbers, units, and proper nouns."
+    # Custom system prompt (default provided)
+    st.markdown("**Translator prompt (system)**")
+    default_sys_prompt = (
+        "You are a professional translator. Translate the content while "
+        "STRICTLY preserving these inline tags: <b>, </b>, <i>, </i>, <bi>, </bi>. "
+        "Do not remove, add, or reorder tags; keep them around the same phrases they wrap. "
+        "Preserve numbers, units, and proper nouns. Use clear, concise business style."
+    )
+    sys_prompt_input = st.text_area(
+        "Customize (optional)",
+        value=default_sys_prompt,
+        height=140,
+        help="This is the system prompt sent to the model. Keep the tag rules."
+    )
+
+    skip_bilingual = st.checkbox(
+        "Skip paragraphs/cells that already look bilingual",
+        value=True,
+        help="If a block already contains both Vietnamese and English (e.g., 'VI … / EN …' or '[VI]… [EN]…'), it will be left untouched."
+    )
+
+    batch_size = st.slider("Batch size per API call", min_value=20, max_value=200, value=100, step=20,
+                           help="Larger batches reduce overhead but may hit token limits on very big docs.")
+
+    run_bi = st.button("Convert to Bilingual DOCX (Batched)", use_container_width=True, disabled=not (client and docx_file))
+
+    # Batched translate callable:
+    #  input:  [{"id": "...", "text": "<bi>...</bi>", "src_lang": "vi|en"}, ...]
+    #  output: {id: "translated_tagged_text", ...}
+    def make_batched_translator(_client, _model: str, _system_prompt: str):
+        def translate_batch_callable(items):
+            # Build a single request with numbered items to reduce overhead.
+            # We ask the model to answer as JSON lines: id|||translated_text
+            user_lines = []
+            for it in items:
+                user_lines.append(f"{it['id']}|||{it['src_lang']}|||{it['text']}")
+            joined = "\n".join(user_lines)
+
+            # Instruct the model to return exactly one line per input, preserving tags.
+            sys = _system_prompt + "\n" + (
+                "Return one line per input in the form:\n"
+                "<id>|||<translated text with the SAME <b>,</b>,<i>,</i>,<bi>,</bi> tags preserved>\n"
+                "Do not add extra lines or explanations."
             )
+
             resp = _client.responses.create(
                 model=_model,
                 input=[
                     {"role": "system", "content": sys},
-                    {"role": "user", "content": f"Translate to {target}:\n\n{text_with_tags}"}
+                    {"role": "user", "content": "Translate each line below. Each line is: id|||src_lang|||tagged_text\n\n" + joined}
                 ]
             )
-            return resp.output_text or ""
-        return translate_fn
+            out = resp.output_text or ""
+            mapping = {}
+            for line in out.splitlines():
+                if "|||" not in line:
+                    continue
+                # split only on first 1 occurrence (id and the rest)
+                parts = line.split("|||", 1)
+                if len(parts) == 2:
+                    _id, trans = parts[0].strip(), parts[1]
+                    mapping[_id] = trans
+            return mapping
+        return translate_batch_callable
 
     if run_bi and client and docx_file:
-        translate_fn = make_openai_translator(client, bilingual_model)
+        from tools.bilingual_fill import process_docx_batched
 
-        # Write input to a temp file, process, and serve
+        # Save upload to temp
         with NamedTemporaryFile(delete=False, suffix=".docx") as in_tmp:
             in_tmp.write(docx_file.getvalue())
             in_tmp.flush()
@@ -177,17 +219,17 @@ with t3:
         out_tmp = NamedTemporaryFile(delete=False, suffix=".docx")
         out_tmp.close()
 
-        with st.spinner("Translating and formatting…"):
-            # The bilingual module already enforces:
-            # - VI first, EN second
-            # - EN italic + Accent1 blue
-            # - Preserve bold/italic spans
-            process_bilingual(
+        translate_batch_callable = make_batched_translator(client, bilingual_model, sys_prompt_input)
+
+        with st.spinner("Collecting items and translating in batches…"):
+            process_docx_batched(
                 in_path=in_path,
                 out_path=out_tmp.name,
-                translate_fn=translate_fn,
+                translate_batch_callable=translate_batch_callable,
                 add_labels=bilingual_labels,
                 table_mode=table_mode,
+                skip_if_bilingual=skip_bilingual,
+                batch_size=batch_size
             )
 
         with open(out_tmp.name, "rb") as f:
@@ -197,4 +239,4 @@ with t3:
                 file_name=Path(docx_file.name).with_suffix(".bilingual.docx").name,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
-        st.success("Done! Vietnamese first, English italic + Accent 1.")
+        st.success("Done! (Batched)")

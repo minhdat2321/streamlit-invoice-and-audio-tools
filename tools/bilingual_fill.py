@@ -1,422 +1,550 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-bilingual_fill.py
-Make Word docs fully bilingual (VI → EN or EN → VI) while preserving look.
-Rules:
-- Order: Vietnamese first, then English
-- English line: italic + Accent 1 (blue)
-- Works even if everyone uses "Normal" style (infers base look from dominant run)
-- Preserves bold/italic spans exactly (via <b>/<i>/<bi> tags)
-- Handles paragraphs + tables
+bilingual_vi_en_openxml_plus_v2.py
+
+Bilingual document styling:
+- Vietnamese text: Normal black, non-italic, Times New Roman (FIRST)
+- English text: Accent1 blue, italic, Times New Roman (SECOND)
+- Vietnamese always comes first, English second
+- FIXED: Vietnamese style now properly applies black color
+- FIXED: Improved translation coverage for English to Vietnamese
 """
 
-import re
-from copy import deepcopy
-from typing import Optional, Tuple, List
+import os, re, math, time, copy, argparse
+from typing import Optional, Dict, List, Tuple, Set
+from zipfile import ZipFile
+from lxml import etree
 
-from docx import Document
-from docx.text.paragraph import Paragraph
-from docx.text.run import Run
-from docx.table import _Cell
-from docx.oxml import OxmlElement
-from docx.enum.dml import MSO_THEME_COLOR_INDEX
-from langdetect import detect, DetectorFactory
+# -------- Namespaces --------
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": W_NS}
 
-# Optional: plug in your translator. Default uses a no-op stub; Streamlit wraps with OpenAI.
-# Provide a function translate_vi_en(text, src_lang)-> str  where src_lang in {"vi","en"}.
-# You can swap this with any engine (OpenAI, Azure, DeepL, etc.)
-def default_translate(text: str, src_lang: str) -> str:
-    # Placeholder – you MUST inject a real translator from your app.
-    return text
+# -------- OpenAI (optional) --------
+try:
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+except Exception:
+    OpenAI = None
+    _OPENAI_AVAILABLE = False
 
-DetectorFactory.seed = 0
+# -------- Language heuristics --------
+_VI_DIACRITICS = (
+    "ăâđêôơư"
+    "áàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệ"
+    "íìỉĩịóòỏõọốồổỗộớờởỡợúùủũụ"
+    "ýỳỷỹỵ"
+    "ĂÂĐÊÔƠƯ"
+    "ÁÀẢÃẠẮẰẲẴẶẤẦẨẪỆ"
+    "ÍÌỈĨỊÓÒỎÕỌỐỒỔỖỘỚỜỞỠỢÚÙỦŨỤ"
+    "ÝỲỶỸỴ"
+)
+VI_CHAR_RE = re.compile(f"[{_VI_DIACRITICS}]")
 
-# -------------------
-# Language utils
-# -------------------
-def detect_lang(text: str) -> Optional[str]:
-    s = (text or "").strip()
+# Numeric patterns - paragraphs that are mostly numbers should not be translated
+NUMERIC_RE = re.compile(r'^[\d\s\.,\-/%°#®™©∙•·]+$')
+PURE_NUMBER_RE = re.compile(r'^\d+$')
+
+ENGLISH_WORD_RE = re.compile(r'^[A-Za-z0-9\s\.,!?\-\'":;@#$%&*()+=\[\]{}<>/\\]+$')
+
+def is_mostly_numeric(s: str) -> bool:
+    s = (s or "").strip()
     if not s:
-        return None
-    try:
-        lang = detect(s)
-        return lang if lang in {"vi", "en"} else None
-    except Exception:
-        return None
-
-def needs_translation(text: str) -> Tuple[bool, Optional[str]]:
-    s = (text or "").strip()
-    if not s:
-        return (False, None)
-    lang = detect_lang(s)
-    if lang not in {"vi", "en"}:
-        return (False, None)
-    return (True, lang)
-
-# -------------------
-# Emphasis tagging (bold/italic)
-# -------------------
-def paragraph_spans(par: Paragraph) -> List[Tuple[str, bool, bool]]:
-    spans = []
-    cur_text, cur_b, cur_i = "", None, None
-    for r in par.runs:
-        t = r.text or ""
-        b = bool(r.bold)
-        i = bool(r.italic)
-        if cur_text and (b == cur_b and i == cur_i):
-            cur_text += t
-        else:
-            if cur_text:
-                spans.append((cur_text, cur_b, cur_i))
-            cur_text, cur_b, cur_i = t, b, i
-    if cur_text:
-        spans.append((cur_text, cur_b, cur_i))
-    return spans
-
-def cell_spans(cell: _Cell) -> List[Tuple[str, bool, bool]]:
-    spans = []
-    cur_text, cur_b, cur_i = "", None, None
-    for p in cell.paragraphs:
-        for r in p.runs:
-            t = r.text or ""
-            b = bool(r.bold)
-            i = bool(r.italic)
-            if cur_text and (b == cur_b and i == cur_i):
-                cur_text += t
-            else:
-                if cur_text:
-                    spans.append((cur_text, cur_b, cur_i))
-                cur_text, cur_b, cur_i = t, b, i
-        if cur_text:
-            spans.append((cur_text, cur_b, cur_i)); cur_text = ""
-    return spans
-
-def tag_spans(spans: List[Tuple[str, bool, bool]]) -> str:
-    pieces = []
-    for txt, b, i in spans:
-        if not txt:
-            continue
-        if b and i:
-            pieces.append(f"<bi>{txt}</bi>")
-        elif b:
-            pieces.append(f"<b>{txt}</b>")
-        elif i:
-            pieces.append(f"<i>{txt}</i>")
-        else:
-            pieces.append(txt)
-    return "".join(pieces)
-
-TAG_TOKEN = re.compile(r"(</?bi>|</?b>|</?i>)")
-
-def parse_tagged_to_segments(tagged_text: str) -> List[Tuple[str, bool, bool]]:
-    bold = italic = False
-    segs: List[Tuple[str, bool, bool]] = []
-    buf: List[str] = []
-
-    def flush():
-        if buf:
-            segs.append(("".join(buf), bold, italic))
-            buf.clear()
-
-    tokens = TAG_TOKEN.split(tagged_text)
-    for tk in tokens:
-        if not tk:
-            continue
-        if tk == "<b>":
-            flush(); bold = True
-        elif tk == "</b>":
-            flush(); bold = False
-        elif tk == "<i>":
-            flush(); italic = True
-        elif tk == "</i>":
-            flush(); italic = False
-        elif tk == "<bi>":
-            flush(); bold = True; italic = True
-        elif tk == "</bi>":
-            flush(); bold = False; italic = False
-        else:
-            buf.append(tk)
-    flush()
-    return segs
-
-# -------------------
-# Visual inference & cloning
-# -------------------
-def font_size_points(run: Run) -> Optional[float]:
-    try:
-        return float(run.font.size.pt) if (run.font.size and hasattr(run.font.size, "pt")) else None
-    except Exception:
-        return None
-
-def visual_weight(run: Run) -> float:
-    text = (run.text or "").strip()
-    if not text:
-        return 0.0
-    score = 0.0
-    size = font_size_points(run)
-    if size:
-        score += size
-    if run.bold:
-        score += 3.0
-    if run.underline:
-        score += 1.5
-    if run.italic:
-        score += 1.0
-    letters = [c for c in text if c.isalpha()]
-    if letters:
-        caps_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
-        if caps_ratio > 0.7 and len(letters) >= 4:
-            score += 2.5
-    score += min(len(text) / 40.0, 2.0)
-    return score
-
-def pick_donor_run_from_paragraph(par: Paragraph) -> Optional[Run]:
-    if not par.runs:
-        return None
-    return max(par.runs, key=visual_weight)
-
-def pick_donor_run_from_cell(cell: _Cell) -> Optional[Run]:
-    cand = None
-    best = -1.0
-    for p in cell.paragraphs:
-        for r in p.runs:
-            w = visual_weight(r)
-            if w > best:
-                best, cand = w, r
-    return cand
-
-def clone_run_format(src_run: Run, dst_run: Run):
-    """
-    Copy run rPr (bold/italic/size/font/color/etc.) by cloning XML.
-    """
-    src_r = src_run._r
-    dst_r = dst_run._r
-    src_rPr = src_r.rPr
-    if src_rPr is not None:
-        dst_rPr = deepcopy(src_rPr)
-        if dst_r.rPr is not None:
-            dst_r.remove(dst_r.rPr)
-        dst_r.append(dst_rPr)
-
-def copy_paragraph_format(src: Paragraph, dst: Paragraph):
-    try:
-        pf_src = src.paragraph_format
-        pf_dst = dst.paragraph_format
-        pf_dst.left_indent = pf_src.left_indent
-        pf_dst.right_indent = pf_src.right_indent
-        pf_dst.first_line_indent = pf_src.first_line_indent
-        pf_dst.space_before = pf_src.space_before
-        pf_dst.space_after = pf_src.space_after
-        pf_dst.line_spacing = pf_src.line_spacing
-        pf_dst.alignment = pf_src.alignment
-    except Exception:
-        pass
-
-# -------------------
-# Guards & prefixes
-# -------------------
-def paragraph_already_followed_by_translation(par: Paragraph) -> bool:
-    parent = par._p.getparent()
-    idx = parent.index(par._p)
-    if idx + 1 < len(parent):
-        nxt = Paragraph(parent[idx + 1], par._parent)
-        a = (par.text or "").strip().lower()
-        b = (nxt.text or "").strip().lower().replace("[en] ", "").replace("[vi] ", "")
-        return a == b
+        return False
+    if PURE_NUMBER_RE.match(s):
+        return True
+    if NUMERIC_RE.match(s):
+        return True
+    if len(s) <= 5 and any(c.isdigit() for c in s):
+        num_count = sum(1 for c in s if c.isdigit())
+        if num_count / len(s) > 0.6:
+            return True
     return False
 
-LIST_PREFIX_RE = re.compile(r"""
-    ^\s*(
-        (\(?[0-9ivxlcdmIVXLCDM]+\)?[.)]?) |   # 1. 1) (1) I. i)
-        ([A-Za-z]\.) |                        # A. a.
-        ([-•*])                               # -, •, *
-    )\s+
-""", re.VERBOSE)
+def is_vi(s: str) -> bool:
+    if is_mostly_numeric(s):
+        return False
+    return bool(VI_CHAR_RE.search(s or ""))
 
-def extract_list_prefix(text: str) -> Tuple[str, str]:
-    m = LIST_PREFIX_RE.match(text or "")
-    if m:
-        prefix = m.group(0)
-        rest = (text or "")[len(prefix):]
-        return prefix, rest
-    return "", text or ""
+def is_enish(s: str) -> bool:
+    s = (s or "").strip()
+    if not s or is_mostly_numeric(s):
+        return False
+    return not is_vi(s) and bool(ENGLISH_WORD_RE.match(s))
 
-# -------------------
-# Theme helpers for EN line
-# -------------------
-def apply_english_style(run: Run):
-    """Make English run italic + Accent 1 (blue)."""
-    run.italic = True
-    try:
-        run.font.color.theme_color = MSO_THEME_COLOR_INDEX.ACCENT_1
-    except Exception:
-        # Fallback: plain blue-ish RGB if theme missing
-        from docx.shared import RGBColor
-        run.font.color.rgb = RGBColor(31, 73, 125)  # similar to Office Accent 1
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace('"', '').replace("'", "")
+    return s.lower()
 
-# -------------------
-# Writers
-# -------------------
-def clear_paragraph(par: Paragraph):
-    # remove all runs
-    for r in list(par.runs):
-        r._r.getparent().remove(r._r)
+def length_ratio(a: str, b: str) -> float:
+    la = max(1, len((a or "").strip()))
+    lb = max(1, len((b or "").strip()))
+    return min(la, lb) / max(la, lb)
 
-def write_runs_from_segments(par: Paragraph, segments: List[Tuple[str, bool, bool]],
-                             donor: Optional[Run], override_italic: Optional[bool] = None,
-                             color_accent1_for_all: bool = False):
-    """Write multiple runs into 'par' from segments, cloning base from donor.
-       If override_italic is not None, force italic per run.
-       If color_accent1_for_all, apply Accent 1 to all runs.
-    """
-    for txt, b, i in segments:
-        if not txt:
+def punct_similarity(a: str, b: str) -> float:
+    a_punct = re.sub(r'[A-Za-zÀ-ỹ0-9\s]', '', a or "")
+    b_punct = re.sub(r'[A-Za-zÀ-ỹ0-9\s]', '', b or "")
+    if not a_punct and not b_punct:
+        return 1.0
+    if not a_punct or not b_punct:
+        return 0.0
+    if a_punct in b_punct or b_punct in a_punct:
+        return 0.8
+    if set(a_punct) == set(b_punct):
+        return 0.9
+    return 0.1
+
+def cosine(u, v):
+    if not u or not v:
+        return 0.0
+    s = sum(a*b for a, b in zip(u, v))
+    nu = math.sqrt(sum(a*a for a in u))
+    nv = math.sqrt(sum(b*b for b in v))
+    if nu == 0 or nv == 0:
+        return 0.0
+    return s / (nu * nv)
+
+# -------- XML helpers --------
+def get_text_from_p(p_el) -> str:
+    return "".join([(t.text or "") for t in p_el.findall(".//w:t", NS)]).strip()
+
+def collect_paragraphs(root) -> List[dict]:
+    body_like = root.find(".//w:body", NS) or root
+    ps = list(body_like.findall(".//w:p", NS))
+    out = []
+    for i, p in enumerate(ps):
+        txt = get_text_from_p(p)
+        out.append({"el": p, "text": txt, "idx": i})
+    return out
+
+def first_run_rPr(src_p):
+    r = src_p.find("w:r", NS)
+    if r is None:
+        r = src_p.find(".//w:r", NS)
+    if r is not None:
+        rPr = r.find("w:rPr", NS)
+        if rPr is not None:
+            return copy.deepcopy(rPr)
+    return None
+
+def ensure_times_new_roman(rPr):
+    if rPr is None:
+        return
+    rFonts = rPr.find("w:rFonts", NS)
+    if rFonts is None:
+        rFonts = etree.SubElement(rPr, f"{{{W_NS}}}rFonts")
+    rFonts.set(f"{{{W_NS}}}ascii", "Times New Roman")
+    rFonts.set(f"{{{W_NS}}}hAnsi", "Times New Roman")
+    rFonts.set(f"{{{W_NS}}}cs", "Times New Roman")
+
+def get_font_size_val(rPr):
+    if rPr is None:
+        return None
+    sz = rPr.find("w:sz", NS)
+    if sz is not None and sz.get(f"{{{W_NS}}}val"):
+        return sz.get(f"{{{W_NS}}}val")
+    szCs = rPr.find("w:szCs", NS)
+    if szCs is not None and szCs.get(f"{{{W_NS}}}val"):
+        return szCs.get(f"{{{W_NS}}}val")
+    return None
+
+def set_font_size_val(rPr, val):
+    if rPr is None:
+        return
+    sz = rPr.find("w:sz", NS)
+    if sz is None:
+        sz = etree.SubElement(rPr, f"{{{W_NS}}}sz")
+    sz.set(f"{{{W_NS}}}val", val)
+    szCs = rPr.find("w:szCs", NS)
+    if szCs is None:
+        szCs = etree.SubElement(rPr, f"{{{W_NS}}}szCs")
+    szCs.set(f"{{{W_NS}}}val", val)
+
+def create_vietnamese_style(rPr):
+    """Vietnamese style: black, non-italic, Times New Roman"""
+    if rPr is None:
+        rPr = etree.Element(f"{{{W_NS}}}rPr")
+    
+    ensure_times_new_roman(rPr)
+    
+    # Remove italic if present
+    i_el = rPr.find("w:i", NS)
+    if i_el is not None:
+        rPr.remove(i_el)
+    
+    # Set black color - ensure it overrides any existing color
+    color = rPr.find("w:color", NS)
+    if color is not None:
+        rPr.remove(color)  # Remove existing color element
+    color = etree.SubElement(rPr, f"{{{W_NS}}}color")
+    color.set(f"{{{W_NS}}}val", "000000")  # Black
+    
+    return rPr
+
+def create_english_style(rPr):
+    """English style: blue, italic, Times New Roman"""
+    if rPr is None:
+        rPr = etree.Element(f"{{{W_NS}}}rPr")
+    
+    ensure_times_new_roman(rPr)
+    
+    # Remove italic if present, then add it
+    i_el = rPr.find("w:i", NS)
+    if i_el is not None:
+        rPr.remove(i_el)
+    etree.SubElement(rPr, f"{{{W_NS}}}i")  # Add italic
+    
+    # Set blue color - ensure it overrides any existing color
+    color = rPr.find("w:color", NS)
+    if color is not None:
+        rPr.remove(color)  # Remove existing color element
+    color = etree.SubElement(rPr, f"{{{W_NS}}}color")
+    color.set(f"{{{W_NS}}}val", "5B9BD5")  # Accent1 blue
+    
+    return rPr
+
+def enforce_language_style(p_el, is_english: bool):
+    """Apply appropriate style to all runs in a paragraph based on language"""
+    for r in p_el.findall(".//w:r", NS):
+        rPr = r.find("w:rPr", NS)
+        if rPr is None:
+            rPr = etree.SubElement(r, f"{{{W_NS}}}rPr")
+        if is_english:
+            create_english_style(rPr)
+        else:
+            create_vietnamese_style(rPr)
+
+def build_paragraph_from_source(src_p, text, is_english: bool, match_size=True):
+    """Build a new paragraph with language-appropriate style"""
+    p_new = etree.Element(f"{{{W_NS}}}p")
+    pPr = src_p.find("w:pPr", NS)
+    if pPr is not None:
+        p_new.append(copy.deepcopy(pPr))
+
+    base_rPr = first_run_rPr(src_p)
+    if base_rPr is None:
+        base_rPr = etree.Element(f"{{{W_NS}}}rPr")
+
+    # Apply language-appropriate style
+    if is_english:
+        base_rPr = create_english_style(base_rPr)
+    else:
+        base_rPr = create_vietnamese_style(base_rPr)
+
+    if match_size:
+        size_val = get_font_size_val(base_rPr)
+        if size_val:
+            set_font_size_val(base_rPr, size_val)
+
+    r = etree.SubElement(p_new, f"{{{W_NS}}}r")
+    r.append(copy.deepcopy(base_rPr))
+    t = etree.SubElement(r, f"{{{W_NS}}}t")
+    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    t.text = text
+    return p_new
+
+# -------- OpenAI helpers --------
+class OpenAIHelper:
+    def __init__(self, chat_model: str, embed_model: Optional[str], temp: float):
+        if not _OPENAI_AVAILABLE:
+            raise RuntimeError("openai==1.x not installed. pip install openai")
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.chat_model = chat_model
+        self.embed_model = embed_model
+        self.temp = temp
+        self._emb_cache: Dict[str, List[float]] = {}
+
+    def translate_en_to_vi(self, text_en: str) -> str:
+        if is_mostly_numeric(text_en):
+            return text_en
+            
+        sys_prompt = (
+            "You are a precise English-to-Vietnamese translator for technical/business documents. "
+            "Return only the Vietnamese translation; no extra quotes or commentary. Preserve numbers, units, model names, punctuation. "
+            "Use professional, formal Vietnamese suitable for business proposals."
+        )
+        user_msg = f"Translate from English to Vietnamese:\n{text_en}"
+        for attempt in range(3):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.chat_model, temperature=self.temp,
+                    messages=[{"role": "system", "content": sys_prompt},
+                              {"role": "user", "content": user_msg}],
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                print(f"Translation attempt {attempt+1} failed: {e}")
+                time.sleep(1.5 * (attempt + 1))
+        print(f"Failed to translate EN→VI: {text_en[:50]}...")
+        return text_en  # Return original if all attempts fail
+
+    def translate_vi_to_en(self, text_vi: str) -> str:
+        if is_mostly_numeric(text_vi):
+            return text_vi
+            
+        sys_prompt = (
+            "You are a precise Vietnamese-to-English translator for technical/business documents. "
+            "Return only the English translation; no extra quotes or commentary. Preserve numbers, units, model names, punctuation."
+        )
+        user_msg = f"Translate from Vietnamese to English:\n{text_vi}"
+        for attempt in range(3):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.chat_model, temperature=self.temp,
+                    messages=[{"role": "system", "content": sys_prompt},
+                              {"role": "user", "content": user_msg}],
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                print(f"Translation attempt {attempt+1} failed: {e}")
+                time.sleep(1.5 * (attempt + 1))
+        print(f"Failed to translate VI→EN: {text_vi[:50]}...")
+        return text_vi  # Return original if all attempts fail
+
+    def embed(self, text: str):
+        if not self.embed_model:
+            return None
+        if text in self._emb_cache:
+            return self._emb_cache[text]
+        for attempt in range(3):
+            try:
+                r = self.client.embeddings.create(model=self.embed_model, input=text)
+                vec = r.data[0].embedding
+                self._emb_cache[text] = vec
+                return vec
+            except Exception as e:
+                print(f"Embedding attempt {attempt+1} failed: {e}")
+                time.sleep(1.5 * (attempt + 1))
+        return None
+
+# -------- Pairing & dedup --------
+def find_pairs_and_existing_norms(paras: List[dict], helper: Optional[OpenAIHelper], window: int, thresh: float, use_embeddings: bool):
+    skip_vi: Set[int] = set()
+    skip_en: Set[int] = set()
+    existing_norms: Set[str] = set()
+
+    n = len(paras)
+
+    def emb(text):
+        return helper.embed(text) if (use_embeddings and helper and helper.embed_model) else None
+
+    # Skip numeric content
+    skip_numeric = set()
+    for i, p in enumerate(paras):
+        nt = normalize_text(p["text"])
+        if nt:
+            existing_norms.add(nt)
+        if is_mostly_numeric(p["text"]):
+            skip_numeric.add(i)
+
+    # Bi-directional pairing
+    for i in range(n):
+        if i in skip_vi or i in skip_en or i in skip_numeric:
             continue
-        r = par.add_run()
-        if donor:
-            clone_run_format(donor, r)
-        # emphasis from source unless overridden
-        r.bold = True if b else False
-        r.italic = (override_italic if override_italic is not None else (True if i else False))
-        if color_accent1_for_all:
-            apply_english_style(r)  # sets italic True; we might need to re-apply italic override
-            if override_italic is not None:
-                r.italic = override_italic
-        r.text = txt
+        ti = (paras[i]["text"] or "").strip()
+        if not ti:
+            continue
 
-def insert_new_par_after(src_par: Paragraph) -> Paragraph:
-    p = src_par._p
-    new_p_xml = OxmlElement("w:p")
-    p.addnext(new_p_xml)
-    new_par = Paragraph(new_p_xml, src_par._parent)
-    copy_paragraph_format(src_par, new_par)
-    if src_par.style is not None:
-        new_par.style = src_par.style
-    return new_par
+        if is_vi(ti):
+            e_vi = emb(ti)
+            for j in range(max(0, i-window), min(n, i+window+1)):
+                if j == i or j in skip_vi or j in skip_en or j in skip_numeric:
+                    continue
+                tj = (paras[j]["text"] or "").strip()
+                if not tj or not is_enish(tj):
+                    continue
+                if length_ratio(ti, tj) < 0.3:
+                    continue
+                if punct_similarity(ti, tj) < 0.5:
+                    continue
+                if use_embeddings and helper and helper.embed_model:
+                    e_en = emb(tj)
+                    sim = cosine(e_vi, e_en) if (e_vi and e_en) else 0.0
+                    if sim >= thresh:
+                        skip_vi.add(i); skip_en.add(j); break
+                else:
+                    norm_i = normalize_text(ti)
+                    norm_j = normalize_text(tj)
+                    if length_ratio(norm_i, norm_j) > 0.6:
+                        skip_vi.add(i); skip_en.add(j); break
 
-# Core rule:
-# - If source VI: keep current paragraph as VI; insert EN below (italic + accent1)
-# - If source EN: replace current paragraph with VI; insert EN below (from original EN) italic + accent1
-def make_paragraph_bilingual(
-    par: Paragraph,
-    translate_fn = default_translate,
-    add_labels: bool = True
-):
-    src_text = par.text or ""
-    need, lang = needs_translation(src_text)
-    if not need:
-        return
-    # Build tagged segments from SOURCE paragraph (for accurate emphasis)
-    src_spans = paragraph_spans(par)
-    tagged_src = tag_spans(src_spans)
-    donor = pick_donor_run_from_paragraph(par) or (par.runs[0] if par.runs else None)
+        elif is_enish(ti):
+            e_en = emb(ti)
+            for j in range(max(0, i-window), min(n, i+window+1)):
+                if j == i or j in skip_vi or j in skip_en or j in skip_numeric:
+                    continue
+                tj = (paras[j]["text"] or "").strip()
+                if not tj or not is_vi(tj):
+                    continue
+                if length_ratio(ti, tj) < 0.3:
+                    continue
+                if punct_similarity(ti, tj) < 0.5:
+                    continue
+                if use_embeddings and helper and helper.embed_model:
+                    e_vi = emb(tj)
+                    sim = cosine(e_en, e_vi) if (e_en and e_vi) else 0.0
+                    if sim >= thresh:
+                        skip_en.add(i); skip_vi.add(j); break
+                else:
+                    norm_i = normalize_text(ti)
+                    norm_j = normalize_text(tj)
+                    if length_ratio(norm_i, norm_j) > 0.6:
+                        skip_en.add(i); skip_vi.add(j); break
 
-    if lang == "vi":
-        # VI is already first; we only add EN line below.
-        if paragraph_already_followed_by_translation(par):
-            return
-        # Translate VI -> EN (preserve tags)
-        translated_tagged = translate_fn(tagged_src, "vi")
-        segs_en = parse_tagged_to_segments(translated_tagged)
-        # Create EN paragraph below, with EN styling
-        new_par = insert_new_par_after(par)
-        if add_labels:
-            new_par.add_run("[EN] ")
-        write_runs_from_segments(new_par, segs_en, donor, override_italic=True, color_accent1_for_all=True)
+    return skip_vi, skip_en, existing_norms
 
-    elif lang == "en":
-        # Need VI first. We'll overwrite the current paragraph with VI,
-        # then add the original EN below (italic + accent1).
-        translated_tagged = translate_fn(tagged_src, "en")
-        segs_vi = parse_tagged_to_segments(translated_tagged)
-        # Overwrite current paragraph with VI
-        vi_par = par
-        if add_labels:
-            clear_paragraph(vi_par)
-            vi_par.add_run("[VI] ")
-        else:
-            clear_paragraph(vi_par)
-        write_runs_from_segments(vi_par, segs_vi, donor, override_italic=False, color_accent1_for_all=False)
+def already_has_translation(neighbors: List[str], candidate: str) -> bool:
+    cand_norm = normalize_text(candidate)
+    for t in neighbors:
+        if normalize_text(t) == cand_norm:
+            return True
+    return False
 
-        # EN line below using ORIGINAL source segments (tagged_src)
-        segs_en_src = parse_tagged_to_segments(tagged_src)  # original EN emphasis
-        en_par = insert_new_par_after(vi_par)
-        if add_labels:
-            en_par.add_run("[EN] ")
-        write_runs_from_segments(en_par, segs_en_src, donor, override_italic=True, color_accent1_for_all=True)
+# -------- Part processing --------
+def process_xml_part(xml_bytes: bytes, min_len: int, helper: Optional[OpenAIHelper],
+                     use_embeddings: bool, embed_thresh: float, window: int) -> bytes:
+    root = etree.fromstring(xml_bytes)
+    paras = collect_paragraphs(root)
 
-def make_cell_bilingual(
-    cell: _Cell,
-    translate_fn = default_translate,
-    add_labels: bool = True,
-    table_mode: str = "stack"
-):
-    raw = (cell.text or "").strip()
-    if not raw:
-        return
-    need, lang = needs_translation(raw)
-    if not need:
-        return
+    # Pairing and current text inventory
+    skip_vi, skip_en, existing_norms = find_pairs_and_existing_norms(
+        paras, helper=helper, window=window, thresh=embed_thresh, use_embeddings=use_embeddings
+    )
 
-    donor = pick_donor_run_from_cell(cell)
-    spans_src = cell_spans(cell)
-    tagged_src = tag_spans(spans_src)
+    # Process all paragraphs in the document
+    processed_count = 0
+    for info in paras:
+        idx, p, txt = info["idx"], info["el"], info["text"]
+        if len((txt or "").strip()) < min_len or is_mostly_numeric(txt):
+            continue
 
-    # Clear cell and rebuild single paragraph
-    for p in list(cell.paragraphs):
-        p._element.getparent().remove(p._element)
-    par = cell.add_paragraph()
+        # Process English paragraphs (translate to Vietnamese)
+        if is_enish(txt) and idx not in skip_en:
+            # Generate Vietnamese translation
+            vi_text = helper.translate_en_to_vi(txt) if helper else txt
+            
+            # Skip if translation is the same as original
+            if normalize_text(vi_text) == normalize_text(txt):
+                continue
+                
+            # De-dup check
+            neighbors = []
+            parent = p.getparent()
+            pos = parent.index(p)
+            for k in range(max(0, pos-window), min(len(parent), pos+window+1)):
+                if k == pos: continue
+                node = parent[k]
+                if node.tag == f"{{{W_NS}}}p":
+                    neighbors.append(get_text_from_p(node))
+            
+            has_similar = False
+            for neighbor in neighbors:
+                if normalize_text(neighbor) == normalize_text(vi_text):
+                    has_similar = True
+                    break
+            if has_similar:
+                continue
+                
+            # Build Vietnamese paragraph - normal black style
+            vi_p = build_paragraph_from_source(p, vi_text, is_english=False, match_size=True)
+            
+            # Convert the original English paragraph to English style (blue italic)
+            enforce_language_style(p, is_english=True)
+            
+            # Insert Vietnamese ABOVE the English paragraph (Vietnamese first, English second)
+            parent.insert(pos, vi_p)
+            processed_count += 1
 
-    if lang == "vi":
-        # VI first (original), then EN (italic blue)
-        # Write VI (from source spans)
-        if add_labels:
-            par.add_run("[VI] ")
-        write_runs_from_segments(par, parse_tagged_to_segments(tagged_src), donor, override_italic=False)
+        # Process Vietnamese paragraphs (translate to English)
+        elif is_vi(txt) and idx not in skip_vi:
+            # Generate English translation
+            en_text = helper.translate_vi_to_en(txt) if helper else txt
+            
+            # Skip if translation is the same as original
+            if normalize_text(en_text) == normalize_text(txt):
+                continue
+                
+            # De-dup check
+            neighbors = []
+            parent = p.getparent()
+            pos = parent.index(p)
+            for k in range(max(0, pos-window), min(len(parent), pos+window+1)):
+                if k == pos: continue
+                node = parent[k]
+                if node.tag == f"{{{W_NS}}}p":
+                    neighbors.append(get_text_from_p(node))
+            
+            has_similar = False
+            for neighbor in neighbors:
+                if normalize_text(neighbor) == normalize_text(en_text):
+                    has_similar = True
+                    break
+            if has_similar:
+                continue
+                
+            # Build English paragraph - blue italic style
+            en_p = build_paragraph_from_source(p, en_text, is_english=True, match_size=True)
+            
+            # Convert the original Vietnamese paragraph to Vietnamese style (normal black)
+            enforce_language_style(p, is_english=False)
+            
+            # For Vietnamese original: Keep Vietnamese first, insert English BELOW (Vietnamese first, English second)
+            # So we insert the English translation AFTER the Vietnamese paragraph
+            parent.insert(pos + 1, en_p)
+            processed_count += 1
 
-        if table_mode == "stack":
-            par.add_run("\n")
-        else:
-            par.add_run(" / ")
+    print(f"Processed {processed_count} paragraphs in this part")
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
 
-        # EN translated
-        segs_en = parse_tagged_to_segments(translate_fn(tagged_src, "vi"))
-        if add_labels:
-            par.add_run("[EN] ")
-        write_runs_from_segments(par, segs_en, donor, override_italic=True, color_accent1_for_all=True)
+# -------- CLI --------
+def main():
+    ap = argparse.ArgumentParser(description="Create bilingual document with Vietnamese first, English second.")
+    ap.add_argument("input_docx")
+    ap.add_argument("output_docx")
+    ap.add_argument("--headers", action="store_true", help="Process headers.")
+    ap.add_argument("--footers", action="store_true", help="Process footers.")
+    ap.add_argument("--min-len", type=int, default=3, help="Minimum paragraph length to consider (default 3).")
+    ap.add_argument("--chat-model", default="gpt-4o-mini", help="OpenAI chat model.")
+    ap.add_argument("--embed-model", default=None, help="OpenAI embeddings model, e.g. text-embedding-3-large.")
+    ap.add_argument("--use-embeddings", action="store_true", help="Use embeddings to confirm VN–EN pairs.")
+    ap.add_argument("--embed-thresh", type=float, default=0.80, help="Cosine threshold for pairing (default 0.80).")
+    ap.add_argument("--window", type=int, default=5, help="Neighborhood window for pairing and dedup (default 5).")
+    ap.add_argument("--temp", type=float, default=0.2, help="Chat translation temperature.")
+    args = ap.parse_args()
 
-    elif lang == "en":
-        # Need VI first. Translate EN->VI, then write EN (original) second with italic blue
-        segs_vi = parse_tagged_to_segments(translate_fn(tagged_src, "en"))
-        if add_labels:
-            par.add_run("[VI] ")
-        write_runs_from_segments(par, segs_vi, donor, override_italic=False)
+    helper = None
+    if _OPENAI_AVAILABLE and args.chat_model:
+        helper = OpenAIHelper(chat_model=args.chat_model, embed_model=args.embed_model, temp=args.temp)
 
-        if table_mode == "stack":
-            par.add_run("\n")
-        else:
-            par.add_run(" / ")
+    with ZipFile(args.input_docx) as zin:
+        parts = {zi.filename: zin.read(zi.filename) for zi in zin.infolist()}
 
-        if add_labels:
-            par.add_run("[EN] ")
-        write_runs_from_segments(par, parse_tagged_to_segments(tagged_src), donor, override_italic=True, color_accent1_for_all=True)
+    to_process = ["word/document.xml"]
+    if args.headers:
+        to_process += [name for name in parts if name.startswith("word/header") and name.endswith(".xml")]
+    if args.footers:
+        to_process += [name for name in parts if name.startswith("word/footer") and name.endswith(".xml")]
 
-def process_docx(
-    in_path: str,
-    out_path: str,
-    translate_fn = default_translate,
-    add_labels: bool = True,
-    table_mode: str = "stack"
-):
-    doc = Document(in_path)
+    for part in to_process:
+        if part in parts:
+            parts[part] = process_xml_part(
+                parts[part],
+                min_len=args.min_len,
+                helper=helper,
+                use_embeddings=args.use_embeddings,
+                embed_thresh=args.embed_thresh,
+                window=args.window,
+            )
 
-    # paragraphs
-    for par in list(doc.paragraphs):
-        make_paragraph_bilingual(par, translate_fn=translate_fn, add_labels=add_labels)
+    with ZipFile(args.output_docx, "w") as zout:
+        for name, data in parts.items():
+            zout.writestr(name, data)
 
-    # tables
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                make_cell_bilingual(cell, translate_fn=translate_fn, add_labels=add_labels, table_mode=table_mode)
+    print(f"Done. Wrote: {args.output_docx}")
 
-    doc.save(out_path)
+if __name__ == "__main__":
+    main()
