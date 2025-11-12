@@ -52,8 +52,13 @@ with st.sidebar:
     invoice_model = st.text_input("Vision model", value=st.session_state["invoice_model"], help="e.g., gpt-4o")
 
     st.write("**Bilingual DOCX**")
-    st.session_state.setdefault("bilingual_model", "gpt-4o-mini")
-    st.text_input("Default translation model", key="bilingual_model", help="e.g., gpt-4o-mini")
+    sidebar_default_model = st.session_state.get("sidebar_bilingual_model", "gpt-4o-mini")
+    st.text_input(
+        "Default translation model",
+        key="sidebar_bilingual_model",
+        value=sidebar_default_model,
+        help="e.g., gpt-4o-mini",
+    )
 
 client = get_openai_client(openai_key, org=st.session_state.get("org")) if openai_key else None
 
@@ -161,9 +166,10 @@ with t3:
         )
 
     with col_right:
+        sidebar_model = st.session_state.get("sidebar_bilingual_model", "gpt-4o-mini")
         chat_model = st.text_input(
             "Chat translation model",
-            value=st.session_state.get("bilingual_model", "gpt-4o-mini"),
+            value=sidebar_model,
             key="bilingual_chat_model",
             help="Leave blank to skip OpenAI translation (styles only).",
         )
@@ -211,9 +217,6 @@ with t3:
         else:
             chat_model_opt = chat_model.strip() or None
             embed_model_opt = embed_model.strip() or None
-
-            if chat_model_opt:
-                st.session_state["bilingual_model"] = chat_model_opt
 
             with st.spinner("Processing document with bilingual_fill.py…"):
                 result_bytes = process_docx_bytes(
