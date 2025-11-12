@@ -212,6 +212,9 @@ with t3:
             chat_model_opt = chat_model.strip() or None
             embed_model_opt = embed_model.strip() or None
 
+            if chat_model_opt:
+                st.session_state["bilingual_model"] = chat_model_opt
+
             with st.spinner("Processing document with bilingual_fill.py…"):
                 result_bytes = process_docx_bytes(
                     docx_file.getvalue(),
